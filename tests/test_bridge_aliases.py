@@ -89,7 +89,7 @@ class BridgeAliasTests(unittest.TestCase):
 
         self.assertIn("from_alias: Proxmox", message)
         self.assertIn("from_id: abc12345", message)
-        self.assertIn("to_id=`Proxmox`", message)
+        self.assertIn("to_id=`abc12345`", message)
 
     def test_alias_tool_is_registered(self) -> None:
         context = FakeContext()
@@ -100,6 +100,9 @@ class BridgeAliasTests(unittest.TestCase):
         schema = context.tools["claude_peers_set_alias"]["schema"]
         self.assertEqual(["alias"], schema["parameters"]["required"])
         self.assertIn("alias", schemas.CLAUDE_PEERS_SEND_MESSAGE["parameters"]["properties"]["to_id"]["description"])
+
+        manifest = (Path(__file__).resolve().parents[1] / "plugin.yaml").read_text()
+        self.assertIn("  - claude_peers_set_alias\n", manifest)
 
     def test_cli_accepts_alias_command(self) -> None:
         parser = argparse.ArgumentParser()

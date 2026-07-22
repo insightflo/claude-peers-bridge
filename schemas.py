@@ -5,7 +5,7 @@ CLAUDE_PEERS_LIST_PEERS = {
     "description": (
         "List live claude-peers broker sessions on this machine, in the current directory, "
         "or in the current git repository. Use this before sending a peer message when you "
-        "need the current peer id."
+        "need the current peer id or alias."
     ),
     "parameters": {
         "type": "object",
@@ -52,7 +52,10 @@ CLAUDE_PEERS_SET_ALIAS = {
         "properties": {
             "alias": {
                 "type": "string",
-                "description": "Unique non-empty alias, for example Mac, A1, or Proxmox.",
+                "description": (
+                    "Unique 1-64 character alias using ASCII letters, digits, spaces, "
+                    "or . _ @ -, for example Mac, A1, or Proxmox."
+                ),
             }
         },
         "required": ["alias"],

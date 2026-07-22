@@ -51,11 +51,60 @@ def _create_legacy_db(path: Path) -> None:
     db.close()
 
 
+def _create_previous_alias_db(path: Path) -> None:
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE peers (
+          id TEXT PRIMARY KEY,
+          pid INTEGER NOT NULL,
+          cwd TEXT NOT NULL,
+          git_root TEXT,
+          tty TEXT,
+          summary TEXT NOT NULL DEFAULT '',
+          registered_at TEXT NOT NULL,
+          last_seen TEXT NOT NULL,
+          alias TEXT
+        );
+        CREATE TABLE messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          from_id TEXT NOT NULL,
+          to_id TEXT NOT NULL,
+          text TEXT NOT NULL,
+          sent_at TEXT NOT NULL,
+          delivered INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    db.executemany(
+        """INSERT INTO peers
+           (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias)
+           VALUES (?, ?, ?, NULL, NULL, '', ?, ?, ?)""",
+        [
+            ("deadbeef", 101, "/one", "2026-07-22T00:00:01Z", now, "Mac"),
+            ("cafebabe", 202, "/two", "2026-07-22T00:00:02Z", now, "mac"),
+            ("facefeed", 303, "/three", "2026-07-22T00:00:03Z", now, "deadbeef"),
+            ("feedface", 404, "/four", "2026-07-22T00:00:04Z", now, "Équipe"),
+        ],
+    )
+    db.execute(
+        """INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
+           VALUES ('cli', 'deadbeef', 'legacy cli message', ?, 0)""",
+        (now,),
+    )
+    db.commit()
+    db.close()
+
+
 class BrokerAliasTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tempdir.name) / "peers.db"
         _create_legacy_db(self.db_path)
+        self._start_broker()
+
+    def _start_broker(self) -> None:
         self.port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         env = os.environ.copy()
@@ -88,13 +137,16 @@ class BrokerAliasTests(unittest.TestCase):
         else:
             self.fail("broker did not become healthy")
 
-    def tearDown(self) -> None:
+    def _stop_broker(self) -> None:
         self.process.terminate()
         try:
             self.process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.communicate(timeout=2)
+
+    def tearDown(self) -> None:
+        self._stop_broker()
         self.tempdir.cleanup()
 
     def post(self, path: str, body: dict, expected_status: int = 200):
@@ -145,7 +197,24 @@ class BrokerAliasTests(unittest.TestCase):
         db.close()
 
         self.assertIn("alias", peer_columns)
+        self.assertIn("alias_key", peer_columns)
         self.assertIn("from_alias", message_columns)
+        self.assertIn("from_kind", message_columns)
+
+    def test_previous_alias_schema_conflicts_are_cleared_during_migration(self) -> None:
+        self._stop_broker()
+        self.db_path.unlink()
+        _create_previous_alias_db(self.db_path)
+
+        self._start_broker()
+
+        aliases = {peer["id"]: peer["alias"] for peer in self.list_peers()}
+        self.assertEqual("Mac", aliases["deadbeef"])
+        self.assertIsNone(aliases["cafebabe"])
+        self.assertIsNone(aliases["facefeed"])
+        self.assertIsNone(aliases["feedface"])
+        inbox = self.post("/poll-messages", {"id": "deadbeef"})["messages"]
+        self.assertEqual("system", inbox[0]["from_kind"])
 
     def test_registration_lists_alias_and_rejects_case_insensitive_duplicate(self) -> None:
         peer_id = self.register("A1", pid=101, cwd="/home/a1")
@@ -153,6 +222,7 @@ class BrokerAliasTests(unittest.TestCase):
         peers = self.list_peers()
         self.assertEqual("A1", peers[0]["alias"])
         self.assertEqual(peer_id, peers[0]["id"])
+        self.assertNotIn("alias_key", peers[0])
 
         conflict = self.post(
             "/register",
@@ -168,6 +238,51 @@ class BrokerAliasTests(unittest.TestCase):
         )
         self.assertEqual("alias_conflict", conflict["error"])
         self.assertEqual(1, len(self.list_peers()))
+
+    def test_same_peer_reregistration_reclaims_its_alias(self) -> None:
+        first_id = self.register("A1", pid=101, cwd="/home/a1")
+
+        second_id = self.register("A1", pid=101, cwd="/home/a1")
+
+        self.assertNotEqual(first_id, second_id)
+        peers = self.list_peers()
+        self.assertEqual(1, len(peers))
+        self.assertEqual(second_id, peers[0]["id"])
+        self.assertEqual("A1", peers[0]["alias"])
+
+    def test_alias_rejects_characters_outside_safe_ascii_contract(self) -> None:
+        invalid = self.post(
+            "/register",
+            {
+                "pid": 101,
+                "logical_name": "Équipe",
+                "cwd": "/home/a1",
+                "git_root": None,
+                "tty": None,
+                "summary": "Hermes Agent",
+            },
+            expected_status=400,
+        )
+
+        self.assertEqual("invalid_alias", invalid["error"])
+
+    def test_alias_cannot_shadow_an_existing_peer_id(self) -> None:
+        peer_id = self.register("A1", pid=101, cwd="/home/a1")
+
+        conflict = self.post(
+            "/register",
+            {
+                "pid": 202,
+                "logical_name": peer_id,
+                "cwd": "/root/proxmox",
+                "git_root": None,
+                "tty": None,
+                "summary": "Hermes Agent",
+            },
+            expected_status=409,
+        )
+
+        self.assertEqual("alias_conflict", conflict["error"])
 
     def test_runtime_alias_change_preserves_current_alias_on_conflict(self) -> None:
         a1_id = self.register("A1", pid=101, cwd="/home/a1")
@@ -209,6 +324,34 @@ class BrokerAliasTests(unittest.TestCase):
         )
         self.assertEqual(a1_id, sent_by_id["to_id"])
         self.assertEqual("A1", sent_by_id["to_alias"])
+
+    def test_message_keeps_sender_alias_from_send_time(self) -> None:
+        a1_id = self.register("A1", pid=101, cwd="/home/a1")
+        proxmox_id = self.register("Proxmox", pid=202, cwd="/root/proxmox")
+        self.post(
+            "/send-message",
+            {"from_id": a1_id, "from_pid": 101, "to_id": proxmox_id, "text": "snapshot"},
+        )
+
+        self.post("/set-alias", {"id": a1_id, "alias": "Controller"})
+        inbox = self.post("/poll-messages", {"id": proxmox_id})["messages"]
+
+        self.assertEqual("A1", inbox[0]["from_alias"])
+
+    def test_unregistered_cli_sender_remains_backward_compatible(self) -> None:
+        proxmox_id = self.register("Proxmox", pid=202, cwd="/root/proxmox")
+
+        sent = self.post(
+            "/send-message",
+            {"from_id": "cli", "from_pid": 999, "to_id": "Proxmox", "text": "system route"},
+        )
+
+        self.assertTrue(sent["ok"])
+        self.assertEqual(proxmox_id, sent["to_id"])
+        inbox = self.post("/poll-messages", {"id": proxmox_id})["messages"]
+        self.assertEqual("cli", inbox[0]["from_id"])
+        self.assertIsNone(inbox[0]["from_alias"])
+        self.assertEqual("system", inbox[0]["from_kind"])
 
 
 if __name__ == "__main__":

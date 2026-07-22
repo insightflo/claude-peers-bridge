@@ -35,7 +35,7 @@ CLAUDE_PEERS_NAME=Mac
 
 ## Human-Readable Peer Aliases
 
-Set a stable alias at registration with `CLAUDE_PEERS_NAME`. Aliases are trimmed and unique across the hub using case-insensitive comparison, so `A1` and `a1` cannot belong to different peers.
+Set a stable alias at registration with `CLAUDE_PEERS_NAME`. Aliases are trimmed, 1-64 characters, limited to ASCII letters, digits, spaces, `.`, `_`, `@`, and `-`, and unique across the hub using case-insensitive comparison, so `A1` and `a1` cannot belong to different peers.
 
 Change the current peer alias later through the Hermes tool:
 
@@ -96,4 +96,4 @@ Do not commit or share the real hub token. Store it in a protected environment f
 
 - **Retry deduplication**: Remote registrations with the same PID and working directory replace the stale row created by the same running gateway after a transient broker outage.
 
-- **Alias identity**: Human-readable aliases are stored separately from work summaries, enforced case-insensitively as unique, and resolved to canonical peer IDs before message persistence.
+- **Alias identity**: Human-readable aliases use the documented safe ASCII contract, are stored separately from work summaries, enforced case-insensitively as unique, and resolved to canonical peer IDs before message persistence.

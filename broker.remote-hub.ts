@@ -73,14 +73,52 @@ function hasColumn(table: string, column: string): boolean {
 if (!hasColumn("peers", "alias")) {
   db.run("ALTER TABLE peers ADD COLUMN alias TEXT");
 }
+if (!hasColumn("peers", "alias_key")) {
+  db.run("ALTER TABLE peers ADD COLUMN alias_key TEXT");
+}
 if (!hasColumn("messages", "from_alias")) {
   db.run("ALTER TABLE messages ADD COLUMN from_alias TEXT");
 }
-db.run(`
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_alias_nocase
-  ON peers(alias COLLATE NOCASE)
-  WHERE alias IS NOT NULL
-`);
+if (!hasColumn("messages", "from_kind")) {
+  db.run("ALTER TABLE messages ADD COLUMN from_kind TEXT NOT NULL DEFAULT 'peer'");
+}
+const migrateAliases = db.transaction(() => {
+  db.run(`
+    UPDATE messages
+    SET from_kind = 'system'
+    WHERE NOT EXISTS (SELECT 1 FROM peers WHERE peers.id = messages.from_id)
+  `);
+  db.run("DROP INDEX IF EXISTS idx_peers_alias_nocase");
+  const peers = db
+    .query("SELECT id, alias FROM peers ORDER BY registered_at ASC, id ASC")
+    .all() as { id: string; alias: string | null }[];
+  const peerIds = new Set(peers.map((peer) => peer.id));
+  const usedKeys = new Set<string>();
+
+  for (const peer of peers) {
+    const normalized = peer.alias?.trim().normalize("NFKC") ?? "";
+    if (!normalized || !isValidAlias(normalized)) {
+      db.run("UPDATE peers SET alias = NULL, alias_key = NULL WHERE id = ?", [peer.id]);
+      continue;
+    }
+    const key = aliasKey(normalized);
+    const shadowsAnotherId = peerIds.has(key) && key !== peer.id;
+    if (usedKeys.has(key) || shadowsAnotherId) {
+      // Keep the peer addressable by ID instead of failing broker startup.
+      db.run("UPDATE peers SET alias = NULL, alias_key = NULL WHERE id = ?", [peer.id]);
+      continue;
+    }
+    db.run("UPDATE peers SET alias = ?, alias_key = ? WHERE id = ?", [normalized, key, peer.id]);
+    usedKeys.add(key);
+  }
+
+  db.run(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_alias_key
+    ON peers(alias_key)
+    WHERE alias_key IS NOT NULL
+  `);
+});
+migrateAliases();
 
 // Local brokers can validate PIDs directly. A remote hub cannot: peer PIDs
 // belong to other machines, so use heartbeat age instead.
@@ -119,8 +157,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias, alias_key)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -132,7 +170,7 @@ const updateSummary = db.prepare(`
 `);
 
 const updateAlias = db.prepare(`
-  UPDATE peers SET alias = ? WHERE id = ?
+  UPDATE peers SET alias = ?, alias_key = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -140,20 +178,22 @@ const deletePeer = db.prepare(`
 `);
 
 const selectAllPeers = db.prepare(`
-  SELECT * FROM peers
+  SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias FROM peers
 `);
 
 const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
+  SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias
+  FROM peers WHERE cwd = ?
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
+  SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias
+  FROM peers WHERE git_root = ?
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, from_alias)
-  VALUES (?, ?, ?, ?, 0, ?)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, from_alias, from_kind)
+  VALUES (?, ?, ?, ?, 0, ?, ?)
 `);
 
 const selectUndelivered = db.prepare(`
@@ -168,11 +208,18 @@ const markDelivered = db.prepare(`
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let id = "";
-  for (let i = 0; i < 8; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)];
+  while (true) {
+    let id = "";
+    for (let i = 0; i < 8; i++) {
+      id += chars[Math.floor(Math.random() * chars.length)];
+    }
+    const collision = db
+      .query("SELECT id FROM peers WHERE id = ? OR alias_key = ?")
+      .get(id, id);
+    if (!collision) {
+      return id;
+    }
   }
-  return id;
 }
 
 // --- Request handlers ---
@@ -197,20 +244,34 @@ function normalizeAlias(value: unknown): string | null {
   if (typeof value !== "string") {
     throw new AliasValidationError("Alias must be a string");
   }
-  const alias = value.trim();
+  const alias = value.trim().normalize("NFKC");
   if (!alias) {
     throw new AliasValidationError("Alias must not be empty");
+  }
+  if (!isValidAlias(alias)) {
+    throw new AliasValidationError(
+      "Alias must be 1-64 characters using ASCII letters, digits, spaces, or . _ @ -",
+    );
   }
   return alias;
 }
 
+function isValidAlias(alias: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._@ -]{0,63}$/.test(alias);
+}
+
+function aliasKey(alias: string): string {
+  return alias.normalize("NFKC").toLowerCase();
+}
+
 function findAliasConflict(alias: string, excludeId?: string): { id: string } | null {
+  const key = aliasKey(alias);
   if (excludeId) {
     return db
-      .query("SELECT id FROM peers WHERE alias = ? COLLATE NOCASE AND id <> ?")
-      .get(alias, excludeId) as { id: string } | null;
+      .query("SELECT id FROM peers WHERE (alias_key = ? OR id = ?) AND id <> ?")
+      .get(key, key, excludeId) as { id: string } | null;
   }
-  return db.query("SELECT id FROM peers WHERE alias = ? COLLATE NOCASE").get(alias) as {
+  return db.query("SELECT id FROM peers WHERE alias_key = ? OR id = ?").get(key, key) as {
     id: string;
   } | null;
 }
@@ -233,7 +294,18 @@ function handleRegister(body: RegisterWithAliasRequest): RegisterResponse & { al
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, alias);
+  insertPeer.run(
+    id,
+    body.pid,
+    body.cwd,
+    body.git_root,
+    body.tty,
+    body.summary,
+    now,
+    now,
+    alias,
+    alias ? aliasKey(alias) : null,
+  );
   return { id, alias };
 }
 
@@ -261,7 +333,7 @@ function handleSetAlias(body: SetAliasRequest): { ok: true; alias: string } {
   if (findAliasConflict(alias, body.id)) {
     throw new AliasConflictError(alias);
   }
-  updateAlias.run(alias, body.id);
+  updateAlias.run(alias, aliasKey(alias), body.id);
   return { ok: true, alias };
 }
 
@@ -318,13 +390,10 @@ function handleSendMessage(
     id: string;
     alias: string | null;
   } | null;
-  if (!sender) {
-    return { ok: false, error: `Sender ${body.from_id} not found` };
-  }
 
   // Preserve exact-ID compatibility, then resolve a human-readable alias.
   const target = (db.query("SELECT id, alias FROM peers WHERE id = ?").get(body.to_id) ??
-    db.query("SELECT id, alias FROM peers WHERE alias = ? COLLATE NOCASE").get(body.to_id)) as {
+    db.query("SELECT id, alias FROM peers WHERE alias_key = ?").get(aliasKey(body.to_id))) as {
       id: string;
       alias: string | null;
     } | null;
@@ -332,7 +401,14 @@ function handleSendMessage(
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
-  insertMessage.run(body.from_id, target.id, body.text, new Date().toISOString(), sender.alias);
+  insertMessage.run(
+    body.from_id,
+    target.id,
+    body.text,
+    new Date().toISOString(),
+    sender?.alias ?? null,
+    sender ? "peer" : "system",
+  );
   return { ok: true, to_id: target.id, to_alias: target.alias };
 }
 

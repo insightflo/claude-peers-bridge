@@ -7,4 +7,5 @@ provides_tools:
   - claude_peers_send_message
   - claude_peers_check_messages
   - claude_peers_set_summary
+  - claude_peers_set_alias
   - claude_peers_bridge_status

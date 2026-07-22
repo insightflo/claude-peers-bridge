@@ -6,7 +6,7 @@ Let humans identify and address claude-peers sessions by stable, readable aliase
 
 ## Data model
 
-Add a nullable `alias` column to the broker `peers` table. Existing databases are migrated on startup with an additive `ALTER TABLE` when the column is absent. Aliases are trimmed, non-empty, and unique across the hub using case-insensitive comparison.
+Add nullable `alias` and normalized `alias_key` columns to the broker `peers` table. Existing databases are migrated on startup with additive `ALTER TABLE` statements when the columns are absent. Aliases are trimmed, NFKC-normalized, 1-64 characters, and limited to ASCII letters, digits, spaces, `.`, `_`, `@`, and `-`; uniqueness uses a lowercase key. Migration runs transactionally; pre-existing invalid, duplicate, or peer-ID-shadowing aliases are cleared while their peers remain addressable by ID.
 
 The existing `summary` remains a description of current work; it is not reused as identity.
 
@@ -24,13 +24,13 @@ Add a broker endpoint `/set-alias`, a Hermes tool `claude_peers_set_alias(alias)
 
 `list-peers` returns each peer's `alias` along with its ID, summary, cwd, and liveness metadata.
 
-`send-message` accepts either an exact peer ID or a case-insensitive alias in the existing `to_id` field. The broker resolves an alias to the canonical peer ID before storing the message. Missing targets return an explicit error. Alias uniqueness prevents ambiguous delivery.
+`send-message` accepts either an exact peer ID or a case-insensitive alias in the existing `to_id` field. The broker resolves an alias to the canonical peer ID before storing the message. Aliases may not shadow another peer's ID, and generated IDs avoid existing alias keys. Missing targets return an explicit error. Alias uniqueness prevents ambiguous delivery.
 
-Incoming messages include `from_alias`; injected Hermes context shows both the readable alias and peer ID. Replies continue to support IDs and may use aliases.
+Incoming messages include `from_alias` and a persisted `from_kind`; injected Hermes context shows both the readable alias and peer ID. Reply guidance is emitted only for registered peers and uses the immutable sender ID so a renamed and later reused alias cannot misroute a reply. Unregistered system/CLI senders remain compatible but are marked system-only, including undelivered messages upgraded from the legacy schema. Manually initiated messages may use IDs or aliases.
 
 ## Compatibility and rollout
 
-Existing ID-based callers keep working. The broker is deployed first, then gateway plugins are updated. Existing peers without an alias remain addressable by ID until they re-register or set an alias.
+Existing ID-based callers and unregistered system/CLI senders keep working. The broker is deployed first, then gateway plugins are updated. Existing peers without an alias remain addressable by ID until they re-register or set an alias.
 
 Rollout order:
 

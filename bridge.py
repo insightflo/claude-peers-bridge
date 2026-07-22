@@ -318,7 +318,7 @@ class ClaudePeersBridge:
         from_kind = message.get("from_kind", "peer")
         sent_at = message.get("sent_at", "")
         reply_note = (
-            f"If a reply is needed, use the tool `claude_peers_send_message` with to_id=`{from_alias}`."
+            f"If a reply is needed, use the tool `claude_peers_send_message` with to_id=`{from_id}`."
             if from_kind == "peer"
             else "This sender is marked as system-only. Do not reply through peer messaging."
         )
