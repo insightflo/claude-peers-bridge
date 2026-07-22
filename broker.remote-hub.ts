@@ -64,6 +64,24 @@ db.run(`
   )
 `);
 
+function hasColumn(table: string, column: string): boolean {
+  const columns = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return columns.some((candidate) => candidate.name === column);
+}
+
+// Additive migrations keep existing broker databases compatible.
+if (!hasColumn("peers", "alias")) {
+  db.run("ALTER TABLE peers ADD COLUMN alias TEXT");
+}
+if (!hasColumn("messages", "from_alias")) {
+  db.run("ALTER TABLE messages ADD COLUMN from_alias TEXT");
+}
+db.run(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_alias_nocase
+  ON peers(alias COLLATE NOCASE)
+  WHERE alias IS NOT NULL
+`);
+
 // Local brokers can validate PIDs directly. A remote hub cannot: peer PIDs
 // belong to other machines, so use heartbeat age instead.
 function cleanStalePeers() {
@@ -101,8 +119,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, alias)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -111,6 +129,10 @@ const updateLastSeen = db.prepare(`
 
 const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
+`);
+
+const updateAlias = db.prepare(`
+  UPDATE peers SET alias = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -130,8 +152,8 @@ const selectPeersByGitRoot = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, from_alias)
+  VALUES (?, ?, ?, ?, 0, ?)
 `);
 
 const selectUndelivered = db.prepare(`
@@ -155,9 +177,48 @@ function generateId(): string {
 
 // --- Request handlers ---
 
-function handleRegister(body: RegisterRequest): RegisterResponse {
+type RegisterWithAliasRequest = RegisterRequest & { logical_name?: string | null };
+type PeerWithAlias = Peer & { alias: string | null };
+type SetAliasRequest = { id: string; alias: string };
+
+class AliasConflictError extends Error {
+  constructor(public alias: string) {
+    super(`Alias ${alias} is already in use`);
+  }
+}
+
+class AliasValidationError extends Error {}
+class PeerNotFoundError extends Error {}
+
+function normalizeAlias(value: unknown): string | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw new AliasValidationError("Alias must be a string");
+  }
+  const alias = value.trim();
+  if (!alias) {
+    throw new AliasValidationError("Alias must not be empty");
+  }
+  return alias;
+}
+
+function findAliasConflict(alias: string, excludeId?: string): { id: string } | null {
+  if (excludeId) {
+    return db
+      .query("SELECT id FROM peers WHERE alias = ? COLLATE NOCASE AND id <> ?")
+      .get(alias, excludeId) as { id: string } | null;
+  }
+  return db.query("SELECT id FROM peers WHERE alias = ? COLLATE NOCASE").get(alias) as {
+    id: string;
+  } | null;
+}
+
+function handleRegister(body: RegisterWithAliasRequest): RegisterResponse & { alias: string | null } {
   const id = generateId();
   const now = new Date().toISOString();
+  const alias = normalizeAlias(body.logical_name);
 
   // A remote PID alone is not globally unique, but PID + cwd is sufficient
   // to collapse retries from the same running gateway after a brief broker
@@ -165,12 +226,15 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const existing = REMOTE_HUB
     ? db.query("SELECT id FROM peers WHERE pid = ? AND cwd = ?").get(body.pid, body.cwd) as { id: string } | null
     : db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  if (alias && findAliasConflict(alias, existing?.id)) {
+    throw new AliasConflictError(alias);
+  }
   if (existing) {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
-  return { id };
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, alias);
+  return { id, alias };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): { ok: boolean; reregister?: boolean } {
@@ -185,26 +249,42 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
-function handleListPeers(body: ListPeersRequest): Peer[] {
-  let peers: Peer[];
+function handleSetAlias(body: SetAliasRequest): { ok: true; alias: string } {
+  const alias = normalizeAlias(body.alias);
+  if (!alias) {
+    throw new AliasValidationError("Alias must not be empty");
+  }
+  const peer = db.query("SELECT id FROM peers WHERE id = ?").get(body.id) as { id: string } | null;
+  if (!peer) {
+    throw new PeerNotFoundError(`Peer ${body.id} not found`);
+  }
+  if (findAliasConflict(alias, body.id)) {
+    throw new AliasConflictError(alias);
+  }
+  updateAlias.run(alias, body.id);
+  return { ok: true, alias };
+}
+
+function handleListPeers(body: ListPeersRequest): PeerWithAlias[] {
+  let peers: PeerWithAlias[];
 
   switch (body.scope) {
     case "machine":
-      peers = selectAllPeers.all() as Peer[];
+      peers = selectAllPeers.all() as PeerWithAlias[];
       break;
     case "directory":
-      peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+      peers = selectPeersByDirectory.all(body.cwd) as PeerWithAlias[];
       break;
     case "repo":
       if (body.git_root) {
-        peers = selectPeersByGitRoot.all(body.git_root) as Peer[];
+        peers = selectPeersByGitRoot.all(body.git_root) as PeerWithAlias[];
       } else {
         // No git root, fall back to directory
-        peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+        peers = selectPeersByDirectory.all(body.cwd) as PeerWithAlias[];
       }
       break;
     default:
-      peers = selectAllPeers.all() as Peer[];
+      peers = selectAllPeers.all() as PeerWithAlias[];
   }
 
   // Exclude the requesting peer
@@ -231,19 +311,33 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+function handleSendMessage(
+  body: SendMessageRequest,
+): { ok: boolean; error?: string; to_id?: string; to_alias?: string | null } {
+  const sender = db.query("SELECT id, alias FROM peers WHERE id = ?").get(body.from_id) as {
+    id: string;
+    alias: string | null;
+  } | null;
+  if (!sender) {
+    return { ok: false, error: `Sender ${body.from_id} not found` };
+  }
+
+  // Preserve exact-ID compatibility, then resolve a human-readable alias.
+  const target = (db.query("SELECT id, alias FROM peers WHERE id = ?").get(body.to_id) ??
+    db.query("SELECT id, alias FROM peers WHERE alias = ? COLLATE NOCASE").get(body.to_id)) as {
+      id: string;
+      alias: string | null;
+    } | null;
   if (!target) {
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
+  insertMessage.run(body.from_id, target.id, body.text, new Date().toISOString(), sender.alias);
+  return { ok: true, to_id: target.id, to_alias: target.alias };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+  const messages = selectUndelivered.all(body.id) as (Message & { from_alias: string | null })[];
 
   // Mark them as delivered
   for (const msg of messages) {
@@ -286,12 +380,14 @@ Bun.serve({
 
       switch (path) {
         case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
+          return Response.json(handleRegister(body as RegisterWithAliasRequest));
         case "/heartbeat":
           return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
+        case "/set-alias":
+          return Response.json(handleSetAlias(body as SetAliasRequest));
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
@@ -305,6 +401,15 @@ Bun.serve({
           return Response.json({ error: "not found" }, { status: 404 });
       }
     } catch (e) {
+      if (e instanceof AliasConflictError) {
+        return Response.json({ error: "alias_conflict", alias: e.alias }, { status: 409 });
+      }
+      if (e instanceof AliasValidationError) {
+        return Response.json({ error: "invalid_alias", message: e.message }, { status: 400 });
+      }
+      if (e instanceof PeerNotFoundError) {
+        return Response.json({ error: "peer_not_found", message: e.message }, { status: 404 });
+      }
       const msg = e instanceof Error ? e.message : String(e);
       return Response.json({ error: msg }, { status: 500 });
     }
