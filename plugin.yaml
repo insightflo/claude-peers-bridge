@@ -1,0 +1,10 @@
+name: claude-peers-bridge
+version: 0.1.0
+description: Hermes bridge for the claude-peers broker with background inbox polling and message injection.
+author: Codex
+provides_tools:
+  - claude_peers_list_peers
+  - claude_peers_send_message
+  - claude_peers_check_messages
+  - claude_peers_set_summary
+  - claude_peers_bridge_status
