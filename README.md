@@ -27,9 +27,35 @@ plugins:
 # Gateway-only: remote broker URL
 CLAUDE_PEERS_BROKER_URL=https://your-broker.example.com
 CLAUDE_PEERS_BROKER_AUTH=Bearer <hub-token>
+# Unique human-readable peer alias
+CLAUDE_PEERS_NAME=Mac
 ```
 
 4. Restart Hermes gateway
+
+## Human-Readable Peer Aliases
+
+Set a stable alias at registration with `CLAUDE_PEERS_NAME`. Aliases are trimmed and unique across the hub using case-insensitive comparison, so `A1` and `a1` cannot belong to different peers.
+
+Change the current peer alias later through the Hermes tool:
+
+```text
+claude_peers_set_alias(alias="A1")
+```
+
+Or through the plugin CLI:
+
+```bash
+hermes claude-peers alias A1
+```
+
+`claude_peers_list_peers` returns both `alias` and `id`. The existing send tool accepts either value:
+
+```text
+claude_peers_send_message(to_id="Proxmox", message="Please ACK this test.")
+```
+
+Peer IDs remain supported for backward compatibility. Incoming messages include both `from_alias` and `from_id`.
 
 ## Remote Hub Broker Setup
 
@@ -69,3 +95,5 @@ Do not commit or share the real hub token. Store it in a protected environment f
 - **Remote peer liveness**: The remote hub uses `last_seen` heartbeat age instead of checking peer PIDs on the hub host. Missing/deleted peer IDs receive `reregister: true`, allowing the bridge to recover automatically.
 
 - **Retry deduplication**: Remote registrations with the same PID and working directory replace the stale row created by the same running gateway after a transient broker outage.
+
+- **Alias identity**: Human-readable aliases are stored separately from work summaries, enforced case-insensitively as unique, and resolved to canonical peer IDs before message persistence.
