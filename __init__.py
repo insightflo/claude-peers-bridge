@@ -10,6 +10,7 @@ from .schemas import (
     CLAUDE_PEERS_CHECK_MESSAGES,
     CLAUDE_PEERS_LIST_PEERS,
     CLAUDE_PEERS_SEND_MESSAGE,
+    CLAUDE_PEERS_SET_ALIAS,
     CLAUDE_PEERS_SET_SUMMARY,
 )
 
@@ -47,6 +48,10 @@ def _handle_set_summary(args, **kwargs):
     return _bridge().set_summary(summary=args["summary"])
 
 
+def _handle_set_alias(args, **kwargs):
+    return _bridge().set_alias(alias=args["alias"])
+
+
 def _handle_status(args, **kwargs):
     return json.dumps(_bridge().status_payload(), ensure_ascii=False)
 
@@ -70,8 +75,10 @@ def _cli_handler(args):
         print(bridge.send_message(to_id=args.to_id, message=" ".join(args.message)))
     elif command == "summary":
         print(bridge.set_summary(summary=" ".join(args.summary)))
+    elif command == "alias":
+        print(bridge.set_alias(alias=" ".join(args.alias)))
     else:
-        print("usage: hermes claude-peers <start|stop|status|check|list|send|summary>")
+        print("usage: hermes claude-peers <start|stop|status|check|list|send|summary|alias>")
 
 
 def _setup_cli(subparser):
@@ -95,6 +102,9 @@ def _setup_cli(subparser):
 
     summary_parser = subs.add_parser("summary", help="Set this peer summary")
     summary_parser.add_argument("summary", nargs="+", help="Summary text")
+
+    alias_parser = subs.add_parser("alias", help="Set this peer's unique human-readable alias")
+    alias_parser.add_argument("alias", nargs="+", help="Unique peer alias")
 
     subparser.set_defaults(func=_cli_handler)
 
@@ -130,6 +140,13 @@ def register(ctx):
         schema=CLAUDE_PEERS_SET_SUMMARY,
         handler=_handle_set_summary,
         description="Update the Hermes peer summary",
+    )
+    ctx.register_tool(
+        name="claude_peers_set_alias",
+        toolset=CLAUDE_PEERS_TOOLSET,
+        schema=CLAUDE_PEERS_SET_ALIAS,
+        handler=_handle_set_alias,
+        description="Set the unique human-readable alias for this peer",
     )
     ctx.register_tool(
         name="claude_peers_bridge_status",

@@ -244,6 +244,21 @@ class ClaudePeersBridge:
         )
         return _json_response(payload)
 
+    def set_alias(self, alias: str) -> str:
+        self._ensure_registered()
+        payload = self._post_json(
+            "/set-alias",
+            {
+                "id": self._state.peer_id,
+                "alias": alias,
+            },
+        )
+        # Update local state only after the broker accepts and normalizes it.
+        accepted_alias = payload.get("alias")
+        if isinstance(accepted_alias, str):
+            self._state.logical_name = accepted_alias
+        return _json_response(payload)
+
     def _run_loop(self) -> None:
         last_heartbeat = 0.0
         while not self._stop_event.is_set():
@@ -299,15 +314,17 @@ class ClaudePeersBridge:
 
     def _format_injected_message(self, message: dict[str, Any]) -> str:
         from_id = message.get("from_id", "unknown")
+        from_alias = message.get("from_alias") or from_id
         from_kind = message.get("from_kind", "peer")
         sent_at = message.get("sent_at", "")
         reply_note = (
-            f"If a reply is needed, use the tool `claude_peers_send_message` with to_id=`{from_id}`."
+            f"If a reply is needed, use the tool `claude_peers_send_message` with to_id=`{from_alias}`."
             if from_kind == "peer"
             else "This sender is marked as system-only. Do not reply through peer messaging."
         )
         return (
             "[claude-peers] New incoming message\n"
+            f"from_alias: {from_alias}\n"
             f"from_id: {from_id}\n"
             f"from_kind: {from_kind}\n"
             f"sent_at: {sent_at}\n\n"
@@ -345,6 +362,9 @@ class ClaudePeersBridge:
         if not peer_id:
             raise RuntimeError(f"Broker register failed: {payload}")
         self._state.peer_id = peer_id
+        registered_alias = payload.get("alias")
+        if isinstance(registered_alias, str):
+            self._state.logical_name = registered_alias
 
     def _heartbeat(self) -> None:
         if not self._state.peer_id:

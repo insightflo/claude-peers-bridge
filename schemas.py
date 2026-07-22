@@ -22,7 +22,7 @@ CLAUDE_PEERS_LIST_PEERS = {
 CLAUDE_PEERS_SEND_MESSAGE = {
     "name": "claude_peers_send_message",
     "description": (
-        "Send a message through the local claude-peers broker to another peer id. "
+        "Send a message through the claude-peers broker to another peer id or unique alias. "
         "Use this to reply to incoming peer messages or to initiate contact."
     ),
     "parameters": {
@@ -30,7 +30,7 @@ CLAUDE_PEERS_SEND_MESSAGE = {
         "properties": {
             "to_id": {
                 "type": "string",
-                "description": "Target peer id from claude_peers_list_peers or an injected inbox event.",
+                "description": "Target peer id or unique alias from claude_peers_list_peers or an injected inbox event.",
             },
             "message": {
                 "type": "string",
@@ -38,6 +38,24 @@ CLAUDE_PEERS_SEND_MESSAGE = {
             },
         },
         "required": ["to_id", "message"],
+    },
+}
+
+CLAUDE_PEERS_SET_ALIAS = {
+    "name": "claude_peers_set_alias",
+    "description": (
+        "Set this peer's unique human-readable alias. The alias is matched case-insensitively "
+        "and can be used instead of a peer id when sending messages."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "alias": {
+                "type": "string",
+                "description": "Unique non-empty alias, for example Mac, A1, or Proxmox.",
+            }
+        },
+        "required": ["alias"],
     },
 }
 
