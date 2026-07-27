@@ -1,4 +1,4 @@
-# claude-peers-bridge
+# hermes-peers-bridge
 
 **English** | [한국어](README.ko.md)
 
@@ -45,7 +45,7 @@ The upstream `claude-peers` broker assumes all peers live on the broker host (it
 git clone https://github.com/louislva/claude-peers-mcp
 cd claude-peers-mcp
 # replace the stock broker with the remote-hub variant
-curl -sL https://raw.githubusercontent.com/insightflo/claude-peers-bridge/main/broker.remote-hub.ts \
+curl -sL https://raw.githubusercontent.com/insightflo/hermes-peers-bridge/main/broker.remote-hub.ts \
   -o broker.ts
 ```
 
@@ -77,7 +77,7 @@ Copy the plugin files into the Hermes plugins directory:
 mkdir -p ~/.hermes/plugins/claude_peers_bridge
 cd ~/.hermes/plugins/claude_peers_bridge
 for f in __init__.py bridge.py schemas.py plugin.yaml; do
-  curl -sLO https://raw.githubusercontent.com/insightflo/claude-peers-bridge/main/$f
+  curl -sLO https://raw.githubusercontent.com/insightflo/hermes-peers-bridge/main/$f
 done
 python3 -m py_compile bridge.py && echo OK
 ```
