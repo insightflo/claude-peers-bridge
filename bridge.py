@@ -149,6 +149,11 @@ class ClaudePeersBridge:
         self._git_root = _git_root(self._cwd)
         self._tty = _tty_name()
         self._pending_injections: "queue.Queue[tuple[int | None, str]]" = queue.Queue()
+        # Dedupe guard: poll runs with mark_delivered=False, so the same
+        # undelivered message comes back every iteration until injection
+        # succeeds. Without this set the pending queue grows one duplicate
+        # per poll tick.
+        self._queued_message_ids: set[int] = set()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -293,6 +298,10 @@ class ClaudePeersBridge:
             self._stop_event.wait(DEFAULT_POLL_INTERVAL)
 
     def _queue_injection(self, content: str, message_id: int | None = None) -> None:
+        if message_id is not None:
+            if message_id in self._queued_message_ids:
+                return
+            self._queued_message_ids.add(message_id)
         self._pending_injections.put((message_id, content))
 
     def _drain_pending_injections(self) -> None:
@@ -301,7 +310,18 @@ class ClaudePeersBridge:
                 message_id, content = self._pending_injections.get_nowait()
             except queue.Empty:
                 return
-            if not self._ctx.inject_message(content, role="system"):
+            injected = False
+            try:
+                injected = bool(self._ctx.inject_message(content, role="system"))
+            except Exception:
+                injected = False
+            if not injected:
+                # Gateway mode: ctx.inject_message requires _cli_ref, which is
+                # None in the gateway process, so incoming peer messages were
+                # silently dropped. Route them through the gateway's own wake
+                # path (home channel) instead.
+                injected = self._inject_via_gateway(content)
+            if not injected:
                 self._pending_injections.put((message_id, content))
                 return
             if message_id is not None:
@@ -311,6 +331,100 @@ class ClaudePeersBridge:
                     self._state.last_error = f"mark delivered failed for message {message_id}: {exc}"
                     self._pending_injections.put((message_id, content))
                     return
+                self._queued_message_ids.discard(message_id)
+
+    def _inject_via_gateway(self, content: str) -> bool:
+        """Deliver an incoming peer message inside a gateway process.
+
+        ``ctx.inject_message`` only works in interactive CLI sessions
+        (``_cli_ref``). In the gateway there is no CLI, so we wake the home
+        channel session via the same ``deliver_wake`` path the kanban
+        notifier uses: schedule a synthetic internal MessageEvent on the
+        gateway event loop. The agent then sees the peer message and can
+        reply with ``claude_peers_send_message``.
+
+        Returns True once the wake turn was scheduled on the loop.
+        """
+        import asyncio
+
+        try:
+            from gateway.run import _gateway_runner_ref, _home_target_env_var, _home_thread_env_var
+            from gateway.session import SessionSource
+        except Exception:
+            return False
+        # gateway.wake only exists in newer Hermes builds. Fall back to the
+        # synthetic-MessageEvent path (what deliver_wake does for push
+        # adapters) so older gateways (e.g. A1) still inject peer messages.
+        try:
+            from gateway.wake import adapter_supports_push, deliver_wake
+        except Exception:
+            deliver_wake = None
+
+            def adapter_supports_push(adapter):
+                return bool(getattr(adapter, "supports_async_delivery", True))
+
+        runner = None
+        try:
+            runner = _gateway_runner_ref()
+        except Exception:
+            runner = None
+        if runner is None:
+            return False
+        loop = getattr(runner, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return False
+        adapters = getattr(runner, "adapters", {}) or {}
+        for platform, adapter in adapters.items():
+            if adapter is None or not adapter_supports_push(adapter):
+                continue
+            platform_name = platform.value if hasattr(platform, "value") else str(platform)
+            try:
+                chat_id = (os.environ.get(_home_target_env_var(platform_name)) or "").strip()
+            except Exception:
+                chat_id = ""
+            if not chat_id:
+                continue
+            try:
+                thread_id = (os.environ.get(_home_thread_env_var(platform_name)) or "").strip() or None
+            except Exception:
+                thread_id = None
+            source = SessionSource(
+                platform=platform,
+                chat_id=chat_id,
+                chat_type="private",
+                thread_id=thread_id,
+            )
+            try:
+                if deliver_wake is not None:
+                    _coro = deliver_wake(adapter, text=content, source=source)
+                else:
+                    from gateway.platforms.base import MessageEvent, MessageType
+
+                    _coro = adapter.handle_message(
+                        MessageEvent(
+                            text=content,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            internal=True,
+                        )
+                    )
+                future = asyncio.run_coroutine_threadsafe(_coro, loop)
+            except Exception as exc:
+                self._state.last_error = f"gateway wake scheduling failed: {exc}"
+                continue
+
+            def _log_wake_result(fut) -> None:
+                try:
+                    fut.result()
+                except Exception as exc:  # pragma: no cover - best-effort logging
+                    self._state.last_error = f"gateway wake turn failed: {exc}"
+
+            future.add_done_callback(_log_wake_result)
+            return True
+        self._state.last_error = (
+            "gateway injection failed: no push-capable adapter with a configured home channel"
+        )
+        return False
 
     def _format_injected_message(self, message: dict[str, Any]) -> str:
         from_id = message.get("from_id", "unknown")
@@ -388,7 +502,17 @@ class ClaudePeersBridge:
         return payload.get("messages", []) or []
 
     def _mark_message_delivered(self, message_id: int) -> None:
-        self._post_json("/mark-message-delivered", {"id": message_id})
+        try:
+            self._post_json("/mark-message-delivered", {"id": message_id})
+        except RuntimeError as exc:
+            # The remote hub broker (broker.remote-hub.ts) marks messages
+            # delivered at poll time and has no /mark-message-delivered
+            # endpoint (HTTP 404). Treat that as already-delivered instead
+            # of failing — otherwise the message is requeued and injected
+            # repeatedly.
+            if "404" in str(exc):
+                return
+            raise
 
     def _unregister(self) -> None:
         if not self._state.peer_id:
