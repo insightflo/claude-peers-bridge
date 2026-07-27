@@ -1,4 +1,4 @@
-# claude-peers-bridge
+# hermes-peers-bridge
 
 [English](README.md) | **한국어**
 
@@ -45,7 +45,7 @@
 git clone https://github.com/louislva/claude-peers-mcp
 cd claude-peers-mcp
 # 기본 브로커를 원격 허브 버전으로 교체
-curl -sL https://raw.githubusercontent.com/insightflo/claude-peers-bridge/main/broker.remote-hub.ts \
+curl -sL https://raw.githubusercontent.com/insightflo/hermes-peers-bridge/main/broker.remote-hub.ts \
   -o broker.ts
 ```
 
@@ -77,7 +77,7 @@ curl -H "Authorization: Bearer $CLAUDE_PEERS_HUB_TOKEN" \
 mkdir -p ~/.hermes/plugins/claude_peers_bridge
 cd ~/.hermes/plugins/claude_peers_bridge
 for f in __init__.py bridge.py schemas.py plugin.yaml; do
-  curl -sLO https://raw.githubusercontent.com/insightflo/claude-peers-bridge/main/$f
+  curl -sLO https://raw.githubusercontent.com/insightflo/hermes-peers-bridge/main/$f
 done
 python3 -m py_compile bridge.py && echo OK
 ```
