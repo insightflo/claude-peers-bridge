@@ -1,5 +1,7 @@
 # claude-peers-bridge
 
+**English** | [한국어](README.ko.md)
+
 **Cross-network peer messaging for [Hermes Agent](https://hermes-agent.nousresearch.com) — let AI agents on different machines talk to each other.**
 
 A Hermes Agent plugin that connects multiple Hermes instances (across different machines and networks) through a central [claude-peers](https://github.com/louislva/claude-peers-mcp) broker hub. Each agent registers as a named peer, and agents can send messages to each other by alias — a gateway agent on a cloud VM can ask the agent on your laptop to run a local task, and get the answer back as a normal conversation turn.
